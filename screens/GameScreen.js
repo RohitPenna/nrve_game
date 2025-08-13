@@ -5,6 +5,9 @@ import {
   StyleSheet,
   Dimensions,
   Animated,
+  Easing,
+  Platform,
+  PanResponder,
 } from 'react-native';
 import { Audio } from 'expo-av';
 import { useNavigation } from '@react-navigation/native';
@@ -12,84 +15,143 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Rect, Defs, LinearGradient, Stop, Circle } from 'react-native-svg';
 
 import AnswerTile from '../components/AnswerTile';
-import CarIndicator from '../components/CarIndicator';
 import { lyricsData } from '../data/lyricsData';
 
 const { width, height } = Dimensions.get('window');
-const BEAT_INTERVAL = 1200; // 50 BPM
-const GAME_DURATION = 90000; // 90 seconds
-const COMBO_BOOST_5 = 5;
-const COMBO_BOOST_10 = 10;
-const GREEN_ZONE_TOLERANCE = 5; // pixels tolerance for detection
+
+/** === Timing & Game Length === */
+const BEAT_INTERVAL = 1200;              // 50 BPM
+const GAME_DURATION_MS = 60000;          // 60 seconds round
+
+/** === Speed & Distance Tuning === */
+const PX_PER_METER = 2.2;                // visual tuning: pixels ~ meters
+const SPEED_MIN = 140;                   // px/sec
+const SPEED_MAX = 520;                   // px/sec cap
+const SPEED_GOOD_INC = 30;               // correct but not perfect
+const SPEED_PERFECT_INC = 80;            // perfect in green zone
+const SPEED_MISS_DEC = 70;               // miss penalty
+const SPEED_COLLISION_DEC = 120;         // bump penalty
+const BOOST_DECAY = 0.96;                // per beat
+
+/** === Green Zones === */
+const GREEN_ZONE_WIDTH = 70;
+const GREEN_ZONE_SPAWN_EVERY_BEATS = 4;
+
+/** === Visuals === */
+const COLORS = {
+  bg: '#0c1020',
+  text: '#e8ecff',
+  subtext: '#b6c0ff',
+  neonGreen: '#39ff88',
+  neonYellow: '#ffd66a',
+  road: '#1a1f3a',
+  roadEdge: '#2b335a',
+  red: '#ff4d4d',
+  neonPink: '#ff6ad5',
+};
+
+const LEFT_MARGIN = 16;
+const SWEET_SPOT_X = Math.max(LEFT_MARGIN + 120, Math.floor(width * 0.35)); // player's fixed visual x
 
 export default function GameScreen() {
   const navigation = useNavigation();
 
-  // State
+  // ===== Game state =====
   const [gameState, setGameState] = useState('waiting');
+
+  /** Rhyme Q&A */
   const [currentLyric, setCurrentLyric] = useState(null);
   const [answerChoices, setAnswerChoices] = useState([]);
-  const [comboCount, setComboCount] = useState(0);
-  const [isBoostActive, setIsBoostActive] = useState(false);
-  const [boostLevel, setBoostLevel] = useState(0);
-  const [timingFeedback, setTimingFeedback] = useState(null);
-  const [aiCars, setAiCars] = useState([]);
-  const [greenZones, setGreenZones] = useState([]); // multiple zones
-  const [score, setScore] = useState({
-    totalCorrect: 0,
-    totalAttempts: 0,
-    perfectHits: 0,
-    bestCombo: 0,
-    rhymeAttempts: 0,
-    rhymeCorrect: 0,
-    creativityAttempts: 0,
-    creativityCorrect: 0,
-  });
+  const [timingFeedback, setTimingFeedback] = useState(null); // 'perfect' | 'good' | 'miss' | 'bump'
 
-  // Refs
+  /** Scoring / HUD */
+  const [comboCount, setComboCount] = useState(0);
+  const [distanceMeters, setDistanceMeters] = useState(0);
+  const [timeLeftMs, setTimeLeftMs] = useState(GAME_DURATION_MS);
+
+  /** World entities */
+  const [traffic, setTraffic] = useState([]); // {id,x,y,speed,color,border}
+  const [greenZones, setGreenZones] = useState([]); // {id,x,width,pulse}
+
+  /** Audio & loops */
   const soundRef = useRef(null);
   const beatTimerRef = useRef(null);
   const gameTimerRef = useRef(null);
-  const startTimeRef = useRef(0);
+  const rafRef = useRef(null);
+
+  /** Loop math refs */
+  const speedRef = useRef(SPEED_MIN);
+  const lastTsRef = useRef(0);
+  const distanceRef = useRef(0);
   const currentBeatRef = useRef(0);
-  const lyricIndexRef = useRef(0);
-  const carPositionRef = useRef(50); // starting x
-  const comboCountRef = useRef(0);
-  const scoreRef = useRef(score);
 
-  // Animated values
-  const carX = useRef(new Animated.Value(50)).current;
-  const comboScale = useRef(new Animated.Value(1)).current;
-  const boostGlow = useRef(new Animated.Value(0)).current;
-  const answerChoicesScale = useRef(new Animated.Value(0)).current;
+  /** Animations */
+  const roadOffset = useRef(new Animated.Value(0)).current;
   const beatRipple = useRef(new Animated.Value(0)).current;
+  const feedbackAnim = useRef(new Animated.Value(0)).current;
 
-  // Sync car animated value into ref
+  // Player position (fixed X, lane-based Y)
+  const carX = useRef(new Animated.Value(SWEET_SPOT_X)).current; // not animated with timing/spring
+  const comboScale = useRef(new Animated.Value(1)).current;      // native
+  const boostGlow = useRef(new Animated.Value(0)).current;       // native
+  const answerChoicesScale = useRef(new Animated.Value(0)).current; // native
+
+  // ===== Lanes =====
+  const roadBottom = height * 0.2;
+  const laneHeights = [55, 45, 35].map((o) => roadBottom + o); // absolute bottoms
+  const [playerLaneIndex, setPlayerLaneIndex] = useState(1);
+  const playerY = useRef(new Animated.Value(laneHeights[1])).current; // JS-driven layout animation
+
+  // keep a ref mirror for logic
+  const playerLaneIndexRef = useRef(1);
   useEffect(() => {
-    const carListener = carX.addListener(({ value }) => {
-      carPositionRef.current = value;
-    });
-    return () => {
-      carX.removeListener(carListener);
-    };
-  }, [carX]);
+    playerLaneIndexRef.current = playerLaneIndex;
+    // IMPORTANT: keep useNativeDriver:false for layout (bottom) animations
+    Animated.spring(playerY, {
+      toValue: laneHeights[playerLaneIndex],
+      useNativeDriver: false,
+      stiffness: 180,
+      damping: 20,
+      mass: 0.8,
+    }).start();
+  }, [playerLaneIndex, playerY, laneHeights]);
 
-  // Initialize audio
+  // ===== Traffic tracking refs for collision calc =====
+  const trafficRef = useRef([]);
+  const collidedIdsRef = useRef(new Set());
+  const collidedFlagRef = useRef(false);
+  const lastCollisionAtRef = useRef(0);
+
+  // ===== Input: swipe up/down to change lane =====
+  const changeLane = useCallback((dir) => {
+    // dir: -1 up, +1 down
+    setPlayerLaneIndex((idx) => {
+      const next = Math.max(0, Math.min(laneHeights.length - 1, idx + dir));
+      return next;
+    });
+  }, [laneHeights.length]);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 12,
+      onPanResponderRelease: (_e, g) => {
+        if (g.dy < -20) changeLane(-1);
+        else if (g.dy > 20) changeLane(1);
+      },
+    })
+  ).current;
+
+  // ===== Audio init =====
   useEffect(() => {
     const initAudio = async () => {
       try {
         const { sound } = await Audio.Sound.createAsync(
           require('../assets/beat.mp3'),
-          { shouldPlay: true, isLooping: true }
+          { shouldPlay: true, isLooping: true, volume: 0.7 }
         );
         soundRef.current = sound;
       } catch (err) {
-        console.log('Audio fallback:', err);
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: 'data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT' },
-          { shouldPlay: true, isLooping: true }
-        );
-        soundRef.current = sound;
+        console.log('Audio load error (fallback silent):', err);
       }
     };
     initAudio();
@@ -98,117 +160,61 @@ export default function GameScreen() {
     };
   }, []);
 
-  // AI car update
-  const updateAiCars = useCallback(() => {
-    setAiCars(prev =>
-      prev.map(car => ({
-        ...car,
-        position: Math.min(car.position + car.speed, width - 60),
-      }))
-    );
-  }, []);
+  // ===== Background road dash loop (purely visual) =====
+  useEffect(() => {
+    Animated.loop(
+      Animated.timing(roadOffset, {
+        toValue: 1,
+        duration: 1400,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      })
+    ).start();
+  }, [roadOffset]);
 
-  // Create and animate a new green zone (with its own listener to track currentX)
-  const createGreenZone = useCallback(() => {
-    const zoneWidth = 120;
-    const id = `green-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const translateX = new Animated.Value(width + 50);
-    const pulse = new Animated.Value(0);
-    // currentX will be kept in object
-    const zone = {
-      id,
-      width: zoneWidth,
-      startTime: Date.now(),
-      translateX,
-      pulse,
-      currentX: width + 50,
-      listenerId: null,
+  // ===== Spawners =====
+  const spawnTrafficCar = useCallback(() => {
+    const laneIndex = Math.floor(Math.random() * laneHeights.length);
+    const colorChoices = [
+      { body: '#2832a3', border: '#6ea8ff' },
+      { body: '#7a2aa0', border: '#ff8bf0' },
+      { body: '#12826f', border: '#55ffde' },
+      { body: '#803c24', border: '#ffb48a' },
+    ];
+    const palette = colorChoices[Math.floor(Math.random() * colorChoices.length)];
+    const t = {
+      id: `t-${Date.now()}-${Math.floor(Math.random() * 9999)}`,
+      x: width + 80,
+      y: laneHeights[laneIndex],
+      speed: 180 + Math.random() * 120, // 180-300 px/sec
+      color: palette.body,
+      border: palette.border,
     };
+    setTraffic((arr) => [...arr, t]);
+  }, [laneHeights]);
 
-    // Listener to keep currentX updated for accurate hit detection
-    const listenerId = translateX.addListener(({ value }) => {
-      zone.currentX = value;
-    });
-    zone.listenerId = listenerId;
-
-    // Pulse loop
+  const spawnGreenZone = useCallback(() => {
+    const gz = {
+      id: `gz-${Date.now()}-${Math.floor(Math.random() * 9999)}`,
+      x: width + 40,
+      width: GREEN_ZONE_WIDTH,
+      pulse: new Animated.Value(0),
+    };
     Animated.loop(
       Animated.sequence([
-        Animated.timing(pulse, {
-          toValue: 1,
-          duration: 500,
-          useNativeDriver: true,
-        }),
-        Animated.timing(pulse, {
-          toValue: 0,
-          duration: 500,
-          useNativeDriver: true,
-        }),
+        Animated.timing(gz.pulse, { toValue: 1, duration: 600, useNativeDriver: true }),
+        Animated.timing(gz.pulse, { toValue: 0, duration: 600, useNativeDriver: true }),
       ])
     ).start();
-
-    // Slide animation
-    Animated.timing(translateX, {
-      toValue: -zoneWidth,
-      duration: 5000,
-      useNativeDriver: true,
-    }).start(({ finished }) => {
-      if (finished) {
-        // cleanup listener before removing zone
-        translateX.removeListener(listenerId);
-        setGreenZones(zones => zones.filter(z => z.id !== id));
-      }
-    });
-
-    setGreenZones(zones => [...zones, zone]);
+    setGreenZones((zones) => [...zones, gz]);
   }, []);
 
-  // Boost effect
-  const triggerBoost = useCallback((level) => {
-    setBoostLevel(level);
-    setIsBoostActive(true);
-
-    Animated.sequence([
-      Animated.timing(boostGlow, {
-        toValue: 1,
-        duration: 200,
-        useNativeDriver: true,
-      }),
-      Animated.timing(boostGlow, {
-        toValue: 0,
-        duration: 200,
-        useNativeDriver: true,
-      }),
-    ]).start();
-
-    Animated.sequence([
-      Animated.spring(comboScale, {
-        toValue: 1.3,
-        damping: 10,
-        stiffness: 100,
-        useNativeDriver: true,
-      }),
-      Animated.spring(comboScale, {
-        toValue: 1,
-        damping: 10,
-        stiffness: 100,
-        useNativeDriver: true,
-      }),
-    ]).start();
-
-    setTimeout(() => {
-      setIsBoostActive(false);
-    }, 3000);
-  }, []);
-
-  // Show lyric and answer choices
   const showNewLyric = useCallback(() => {
     if (lyricsData && lyricsData.length > 0) {
-      // Randomly select a lyric
       const randomIndex = Math.floor(Math.random() * lyricsData.length);
       const lyric = lyricsData[randomIndex];
       setCurrentLyric(lyric);
-      
+
       const choices = lyric.options.map((word, index) => ({
         id: `lyric${randomIndex}-opt${index}-${word}-${Math.floor(Math.random() * 1000)}`,
         word,
@@ -216,308 +222,290 @@ export default function GameScreen() {
         index,
         startTime: Date.now(),
       }));
+
       setAnswerChoices(choices);
       Animated.spring(answerChoicesScale, {
         toValue: 1,
-        damping: 15,
-        stiffness: 150,
+        damping: 16,
+        stiffness: 140,
         useNativeDriver: true,
       }).start();
     }
-  }, []);
+  }, [answerChoicesScale]);
 
-  // Check if car is in any active green zone
-  const isCarInAnyGreenZone = useCallback(() => {
-    const carCenter = carPositionRef.current + 25; // assume car width ~50
-    for (const zone of greenZones) {
-      const left = zone.currentX - GREEN_ZONE_TOLERANCE;
-      const right = zone.currentX + zone.width + GREEN_ZONE_TOLERANCE;
-      if (carCenter >= left && carCenter <= right) {
-        return true;
+  // ===== Core game loop =====
+  const step = useCallback((ts) => {
+    if (gameState !== 'playing') return;
+    if (!lastTsRef.current) lastTsRef.current = ts;
+    const dt = Math.min(0.05, (ts - lastTsRef.current) / 1000);
+    lastTsRef.current = ts;
+
+    const playerSpeed = speedRef.current;
+    const playerCenterX = SWEET_SPOT_X + 22; // ~car width/2
+    const playerLaneYNow = laneHeights[playerLaneIndexRef.current];
+
+    // Move traffic + detect collisions inside updater
+    collidedFlagRef.current = false;
+    setTraffic((arr) => {
+      const next = [];
+      for (const c of arr) {
+        const relative = playerSpeed - c.speed; // px/sec
+        const nx = c.x - relative * dt;
+
+        // Collision check: same lane and x overlap near the player
+        if (Math.abs(c.y - playerLaneYNow) < 1) {
+          const overlapLeft = playerCenterX - 30;
+          const overlapRight = playerCenterX + 24;
+          const carCenter = nx + 17; // ~half of 35
+          if (carCenter >= overlapLeft && carCenter <= overlapRight) {
+            const now = Date.now();
+            if (!collidedIdsRef.current.has(c.id) && now - lastCollisionAtRef.current > 350) {
+              collidedIdsRef.current.add(c.id);
+              collidedFlagRef.current = true;
+              lastCollisionAtRef.current = now;
+            }
+          }
+        }
+
+        if (nx > -120) {
+          next.push({ ...c, x: nx });
+        } else {
+          if (collidedIdsRef.current.has(c.id)) collidedIdsRef.current.delete(c.id);
+        }
       }
+      trafficRef.current = next;
+      return next;
+    });
+
+    // Move green zones
+    setGreenZones((zones) => {
+      const next = [];
+      for (const z of zones) {
+        const nx = z.x - playerSpeed * dt;
+        if (nx > -z.width) next.push({ ...z, x: nx });
+      }
+      return next;
+    });
+
+    // Apply collision penalty (once per frame)
+    if (collidedFlagRef.current) {
+      speedRef.current = Math.max(SPEED_MIN, speedRef.current - SPEED_COLLISION_DEC);
+      setComboCount(0);
+      setTimingFeedback('bump');
+      feedbackAnim.setValue(0);
+      Animated.sequence([
+        Animated.timing(feedbackAnim, { toValue: 1, duration: 120, useNativeDriver: true }),
+        Animated.timing(feedbackAnim, { toValue: 0, delay: 280, duration: 180, useNativeDriver: true }),
+      ]).start(() => setTimingFeedback(null));
+    }
+
+    // Distance + timer
+    const dpx = playerSpeed * dt;
+    distanceRef.current += dpx / PX_PER_METER;
+    setDistanceMeters(distanceRef.current);
+
+    setTimeLeftMs((prev) => {
+      const after = Math.max(0, prev - Math.round(dt * 1000));
+      if (after === 0) endGame();
+      return after;
+    });
+
+    rafRef.current = requestAnimationFrame(step);
+  }, [gameState, laneHeights, feedbackAnim]);
+
+  // ===== Beat loop =====
+  const startBeatLoop = useCallback(() => {
+    beatTimerRef.current = setInterval(() => {
+      currentBeatRef.current++;
+
+      Animated.sequence([
+        Animated.timing(beatRipple, { toValue: 1, duration: 200, useNativeDriver: true }),
+        Animated.timing(beatRipple, { toValue: 0, duration: 400, useNativeDriver: true }),
+      ]).start();
+
+      if (currentBeatRef.current % GREEN_ZONE_SPAWN_EVERY_BEATS === 0) {
+        showNewLyric();
+        spawnGreenZone();
+        spawnTrafficCar();
+        spawnTrafficCar();
+      } else {
+        if (Math.random() < 0.45) spawnTrafficCar();
+      }
+
+      // gentle decay
+      speedRef.current = Math.max(SPEED_MIN, speedRef.current * BOOST_DECAY);
+    }, BEAT_INTERVAL);
+  }, [beatRipple, showNewLyric, spawnGreenZone, spawnTrafficCar]);
+
+  // ===== Green zone check =====
+  const isCarInAnyGreenZone = useCallback(() => {
+    const carCenter = SWEET_SPOT_X + 22;
+    for (const z of greenZones) {
+      const left = z.x;
+      const right = z.x + z.width;
+      if (carCenter >= left && carCenter <= right) return true;
     }
     return false;
   }, [greenZones]);
 
-  // Handle answer tap
-  const handleAnswerTap = useCallback(
-    (choice) => {
-      const now = Date.now();
-      const isCorrect = choice.isCorrect;
+  const triggerBoostFX = useCallback(() => {
+    Animated.sequence([
+      Animated.timing(boostGlow, { toValue: 1, duration: 200, useNativeDriver: true }),
+      Animated.timing(boostGlow, { toValue: 0, duration: 350, useNativeDriver: true }),
+    ]).start();
 
-      const beatTime = startTimeRef.current + currentBeatRef.current * BEAT_INTERVAL;
-      const beatOffset = Math.abs(now - beatTime);
-      const reactionTime = choice.startTime ? now - choice.startTime : 0;
+    Animated.sequence([
+      Animated.spring(comboScale, { toValue: 1.22, damping: 10, stiffness: 140, useNativeDriver: true }),
+      Animated.spring(comboScale, { toValue: 1, damping: 12, stiffness: 140, useNativeDriver: true }),
+    ]).start();
+  }, [boostGlow, comboScale]);
 
-      const carInGreenZone = isCarInAnyGreenZone();
+  // ===== Answer handling -> speed changes =====
+  const handleAnswerTap = useCallback((choice) => {
+    const isCorrect = !!choice.isCorrect;
+    const inZone = isCarInAnyGreenZone();
 
-      let feedback = 'miss';
-      if (isCorrect && carInGreenZone) {
-        feedback = 'perfect';
-      } else if (isCorrect) {
-        feedback = 'good';
-      }
+    let feedback = 'miss';
+    if (isCorrect && inZone) feedback = 'perfect';
+    else if (isCorrect) feedback = 'good';
 
-      setTimingFeedback(feedback);
-      setTimeout(() => setTimingFeedback(null), 1000);
+    setTimingFeedback(feedback);
+    feedbackAnim.setValue(0);
+    Animated.sequence([
+      Animated.timing(feedbackAnim, { toValue: 1, duration: 180, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+      Animated.timing(feedbackAnim, { toValue: 0, delay: 450, duration: 220, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+    ]).start(() => setTimingFeedback(null));
 
-      if (isCorrect && carInGreenZone) {
-        const newCombo = comboCountRef.current + 1;
-        comboCountRef.current = newCombo;
-        setComboCount(newCombo);
+    if (feedback === 'perfect') {
+      speedRef.current = Math.min(SPEED_MAX, speedRef.current + SPEED_PERFECT_INC);
+      triggerBoostFX();
+      setComboCount((c) => c + 1);
+    } else if (feedback === 'good') {
+      speedRef.current = Math.min(SPEED_MAX, speedRef.current + SPEED_GOOD_INC);
+      setComboCount((c) => c + 1);
+    } else {
+      speedRef.current = Math.max(SPEED_MIN, speedRef.current - SPEED_MISS_DEC);
+      setComboCount(0);
+    }
 
-        const moveDistance = isBoostActive ? 30 : 20;
-        const targetPos = Math.min(carPositionRef.current + moveDistance, width - 100);
-        carPositionRef.current = targetPos;
-        Animated.timing(carX, {
-          toValue: targetPos,
-          duration: 200,
-          useNativeDriver: true,
-        }).start();
+    Animated.timing(answerChoicesScale, { toValue: 0, duration: 150, useNativeDriver: true }).start(() => {
+      setAnswerChoices([]);
+    });
+  }, [isCarInAnyGreenZone, triggerBoostFX, feedbackAnim, answerChoicesScale]);
 
-        if (newCombo === COMBO_BOOST_5 && boostLevel === 0) {
-          triggerBoost(1);
-        } else if (newCombo === COMBO_BOOST_10 && boostLevel === 1) {
-          triggerBoost(2);
-        }
+  // ===== Start / End =====
+  const startGame = useCallback(() => {
+    setGameState('playing');
+    setTraffic([]);
+    setGreenZones([]);
+    setDistanceMeters(0);
+    setTimeLeftMs(GAME_DURATION_MS);
+    distanceRef.current = 0;
+    speedRef.current = SPEED_MIN;
+    currentBeatRef.current = 0;
+    lastTsRef.current = 0;
+    setComboCount(0);
+    setPlayerLaneIndex(1);
+    playerLaneIndexRef.current = 1;
+    collidedIdsRef.current.clear();
 
-        // Track rhyme and creativity metrics
-        const isRhymeQuestion = currentLyric?.rhyme === 'yes';
-        const isCreativityQuestion = currentLyric?.creative === 'yes';
-        
-        console.log('Lyric Debug:', {
-          lyricId: currentLyric?.id,
-          rhyme: currentLyric?.rhyme,
-          creative: currentLyric?.creative,
-          isRhymeQuestion,
-          isCreativityQuestion,
-          rhymeAttempts: scoreRef.current.rhymeAttempts,
-          rhymeCorrect: scoreRef.current.rhymeCorrect,
-          creativityAttempts: scoreRef.current.creativityAttempts,
-          creativityCorrect: scoreRef.current.creativityCorrect
-        });
-        
-        scoreRef.current = {
-          ...scoreRef.current,
-          totalCorrect: scoreRef.current.totalCorrect + 1,
-          totalAttempts: scoreRef.current.totalAttempts + 1,
-          perfectHits: scoreRef.current.perfectHits + 1,
-          bestCombo: Math.max(scoreRef.current.bestCombo, newCombo),
-          rhymeAttempts: scoreRef.current.rhymeAttempts + (isRhymeQuestion ? 1 : 0),
-          rhymeCorrect: scoreRef.current.rhymeCorrect + (isRhymeQuestion ? 1 : 0),
-          creativityAttempts: scoreRef.current.creativityAttempts + (isCreativityQuestion ? 1 : 0),
-          creativityCorrect: scoreRef.current.creativityCorrect + (isCreativityQuestion ? 1 : 0),
-        };
-        setScore(scoreRef.current);
-      } else if (isCorrect) {
-        comboCountRef.current = 0;
-        setComboCount(0);
-        
-        // Track rhyme and creativity metrics for correct but off-zone
-        const isRhymeQuestion = currentLyric?.rhyme === 'yes';
-        const isCreativityQuestion = currentLyric?.creative === 'yes';
-        
-        // For "good" answers: count positively for rhyme/creativity, negatively for beat sync
-        scoreRef.current = {
-          ...scoreRef.current,
-          totalAttempts: scoreRef.current.totalAttempts + 1,
-          rhymeAttempts: scoreRef.current.rhymeAttempts + (isRhymeQuestion ? 1 : 0),
-          rhymeCorrect: scoreRef.current.rhymeCorrect + (isRhymeQuestion ? 1 : 0), // Count as correct for rhyme
-          creativityAttempts: scoreRef.current.creativityAttempts + (isCreativityQuestion ? 1 : 0),
-          creativityCorrect: scoreRef.current.creativityCorrect + (isCreativityQuestion ? 1 : 0), // Count as correct for creativity
-        };
-        setScore(scoreRef.current);
-      } else {
-        comboCountRef.current = 0;
-        setComboCount(0);
-        setIsBoostActive(false);
-        setBoostLevel(0);
-        const backPos = Math.max(carPositionRef.current - 15, 0);
-        carPositionRef.current = backPos;
-        Animated.timing(carX, {
-          toValue: backPos,
-          duration: 200,
-          useNativeDriver: true,
-        }).start();
-        // Track rhyme and creativity metrics for misses
-        const isRhymeQuestion = currentLyric?.rhyme === 'yes';
-        const isCreativityQuestion = currentLyric?.creative === 'yes';
-        
-        scoreRef.current = {
-          ...scoreRef.current,
-          totalAttempts: scoreRef.current.totalAttempts + 1,
-          rhymeAttempts: scoreRef.current.rhymeAttempts + (isRhymeQuestion ? 1 : 0),
-          creativityAttempts: scoreRef.current.creativityAttempts + (isCreativityQuestion ? 1 : 0),
-        };
-        setScore(scoreRef.current);
-      }
+    // layout value only; don't mix drivers
+    carX.setValue(SWEET_SPOT_X);
 
-      Animated.timing(answerChoicesScale, {
-        toValue: 0,
-        duration: 150,
-        useNativeDriver: true,
-      }).start();
-      setTimeout(() => setAnswerChoices([]), 200);
-    },
-    [isCarInAnyGreenZone, isBoostActive, boostLevel, triggerBoost]
-  );
+    showNewLyric();
+    spawnGreenZone();
+    for (let i = 0; i < 3; i++) spawnTrafficCar();
 
-  // End game
+    startBeatLoop();
+    rafRef.current = requestAnimationFrame(step);
+    gameTimerRef.current = setTimeout(() => endGame(), GAME_DURATION_MS);
+  }, [carX, showNewLyric, spawnGreenZone, spawnTrafficCar, startBeatLoop, step]);
+
   const endGame = useCallback(() => {
     if (beatTimerRef.current) clearInterval(beatTimerRef.current);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     if (gameTimerRef.current) clearTimeout(gameTimerRef.current);
     if (soundRef.current) soundRef.current.stopAsync();
 
-    const finalScore = {
-      ...scoreRef.current,
-      rhyme_accuracy_score:
-        scoreRef.current.rhymeAttempts > 0
-          ? Math.round((scoreRef.current.rhymeCorrect / scoreRef.current.rhymeAttempts) * 100)
-          : 0,
-      beat_sync_accuracy:
-        scoreRef.current.totalAttempts > 0
-          ? Math.round((scoreRef.current.perfectHits / scoreRef.current.totalAttempts) * 100)
-          : 0,
-      creativity_score:
-        scoreRef.current.creativityAttempts > 0
-          ? Math.round((scoreRef.current.creativityCorrect / scoreRef.current.creativityAttempts) * 100)
-          : 0,
-    };
-
-    setScore(finalScore);
     setGameState('finished');
-
     setTimeout(() => {
-      navigation.navigate('Result', { score: finalScore });
-    }, 1500);
-  }, [navigation]);
-
-  // Start game
-  const startGame = useCallback(() => {
-    setGameState('playing');
-    startTimeRef.current = Date.now();
-    currentBeatRef.current = 0;
-    lyricIndexRef.current = 0;
-    carPositionRef.current = 50;
-    comboCountRef.current = 0;
-    carX.setValue(50);
-    setComboCount(0);
-    setIsBoostActive(false);
-    setBoostLevel(0);
-    scoreRef.current = {
-      totalCorrect: 0,
-      totalAttempts: 0,
-      perfectHits: 0,
-      bestCombo: 0,
-      rhymeAttempts: 0,
-      rhymeCorrect: 0,
-      creativityAttempts: 0,
-      creativityCorrect: 0,
-    };
-    setScore(scoreRef.current);
-    setGreenZones([]);
-
-    setAiCars([
-      { id: 1, position: 50, speed: 0.5 },
-      { id: 2, position: 150, speed: 0.3 },
-      { id: 3, position: 250, speed: 0.7 },
-    ]);
-
-    showNewLyric();
-    createGreenZone();
-
-    beatTimerRef.current = setInterval(() => {
-      currentBeatRef.current++;
-
-      // Beat ripple
-      Animated.sequence([
-        Animated.timing(beatRipple, {
-          toValue: 1,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-        Animated.timing(beatRipple, {
-          toValue: 0,
-          duration: 400,
-          useNativeDriver: true,
-        }),
-      ]).start();
-
-      if (currentBeatRef.current % 4 === 0) {
-        showNewLyric();
-        createGreenZone();
-      }
-
-      updateAiCars();
-    }, BEAT_INTERVAL);
-
-    gameTimerRef.current = setTimeout(() => {
-      endGame();
-    }, GAME_DURATION);
-  }, [showNewLyric, createGreenZone, updateAiCars, endGame]);
+      navigation.navigate('Result', {
+        score: {
+          distance_m: Math.round(distanceRef.current),
+          best_combo: comboCount,
+        },
+      });
+    }, 800);
+  }, [navigation, comboCount]);
 
   useEffect(() => {
-    const timer = setTimeout(() => startGame(), 1000);
-    return () => clearTimeout(timer);
+    const t = setTimeout(() => startGame(), 900);
+    return () => clearTimeout(t);
   }, [startGame]);
 
   useEffect(() => {
     return () => {
       if (beatTimerRef.current) clearInterval(beatTimerRef.current);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
       if (gameTimerRef.current) clearTimeout(gameTimerRef.current);
       if (soundRef.current) soundRef.current.stopAsync();
     };
   }, []);
 
-  // Memoized renders
-  const memoizedAnswerTiles = useMemo(() => {
-    return answerChoices.map(choice => (
-      <AnswerTile
-        key={choice.id}
-        choice={choice}
-        onPress={() => handleAnswerTap(choice)}
-        comboCount={comboCount}
-        isBoostActive={isBoostActive}
-      />
-    ));
-  }, [answerChoices, comboCount, isBoostActive, handleAnswerTap]);
+  // ===== UI computed values =====
+  const memoizedAnswerTiles = useMemo(
+    () =>
+      answerChoices.map((choice) => (
+        <AnswerTile
+          key={choice.id}
+          choice={choice}
+          onPress={() => handleAnswerTap(choice)}
+          comboCount={comboCount}
+          isBoostActive={false}
+        />
+      )),
+    [answerChoices, comboCount, handleAnswerTap]
+  );
 
-  const memoizedAiCars = useMemo(() => {
-    return aiCars.map(car => (
-      <View key={`ai-${car.id}`} style={[styles.aiCar, { left: car.position }]}>
-        <Svg width={50} height={30}>
-          <Rect x={5} y={8} width={40} height={14} fill="#666" rx={3} />
-          <Circle cx={12} cy={22} r={4} fill="#444" />
-          <Circle cx={38} cy={22} r={4} fill="#444" />
-        </Svg>
-      </View>
-    ));
-  }, [aiCars]);
+  const dashTranslate = roadOffset.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, -40],
+  });
+
+  const feedbackScale = feedbackAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.6, 1],
+  });
+  const feedbackOpacity = feedbackAnim;
+
+  const mm = Math.floor(timeLeftMs / 60000);
+  const ss = Math.floor((timeLeftMs % 60000) / 1000);
+  const timeStr = `${mm}:${ss.toString().padStart(2, '0')}`;
 
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.gameArea}>
-        {/* Background */}
+      <View style={styles.gameArea} {...panResponder.panHandlers}>
+
+        {/* HUD */}
+        <View style={styles.hud}>
+          <Text style={styles.hudText}>Time: {timeStr}</Text>
+          <Text style={styles.hudText}>Distance: {Math.floor(distanceMeters)} m</Text>
+          <Text style={styles.hudText}>Speed: {Math.round(speedRef.current / PX_PER_METER)} m/s</Text>
+        </View>
+
+        {/* Background sky */}
         <View style={styles.skyline}>
-          <Svg width={width * 2} height={height * 0.6}>
+          <Svg width={width} height={height * 0.6}>
             <Defs>
               <LinearGradient id="skyGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                <Stop offset="0%" stopColor="#1a1a2e" />
-                <Stop offset="50%" stopColor="#16213e" />
-                <Stop offset="100%" stopColor="#0f3460" />
+                <Stop offset="0%" stopColor="#0e1240" />
+                <Stop offset="60%" stopColor="#0a0f2e" />
+                <Stop offset="100%" stopColor="#070b23" />
               </LinearGradient>
             </Defs>
-            <Rect width={width * 2} height={height * 0.6} fill="url(#skyGradient)" />
-            {[...Array(16)].map((_, i) => (
-              <Rect
-                key={`building-${i}`}
-                x={i * (width / 8)}
-                y={height * 0.3 - Math.random() * 150}
-                width={width / 8 - 10}
-                height={100 + Math.random() * 200}
-                fill={`hsl(${200 + Math.random() * 60}, 70%, ${30 + Math.random() * 20}%)`}
-                opacity={0.8}
-              />
+            <Rect width={width} height={height * 0.6} fill="url(#skyGradient)" />
+            {[...Array(30)].map((_, i) => (
+              <Circle key={i} cx={Math.random() * width} cy={Math.random() * height * 0.5} r={Math.random() * 1.6 + 0.4} fill="#cfe4ff" opacity={0.8} />
             ))}
           </Svg>
         </View>
@@ -526,168 +514,130 @@ export default function GameScreen() {
         <View style={styles.road}>
           <View style={styles.roadShoulder} />
           <View style={styles.roadLane}>
-            {greenZones.map(zone => (
-              <Animated.View
+            {/* Center dashes */}
+            <Animated.View style={[styles.roadDashesRow, { transform: [{ translateX: dashTranslate }] }]}>
+              {Array.from({ length: 30 }).map((_, idx) => (<View key={idx} style={styles.roadDash} />))}
+            </Animated.View>
+
+            {/* Green Zones */}
+            {greenZones.map((zone) => (
+              <View
                 key={zone.id}
-                style={[
-                  styles.greenZone,
-                  {
-                    width: zone.width,
-                    transform: [
-                      { translateX: zone.translateX },
-                      {
-                        scale: zone.pulse.interpolate({
-                          inputRange: [0, 1],
-                          outputRange: [1, 1.1],
-                        }),
-                      },
-                    ],
-                    opacity: zone.pulse.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [0.7, 1],
-                    }),
-                  },
-                ]}
+                style={[styles.greenZone, { width: zone.width, left: zone.x }]}
               >
                 <Animated.View
-                  style={[
-                    styles.beatRipple,
-                    {
-                      opacity: beatRipple.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [0.8, 0],
-                      }),
-                      transform: [
-                        {
-                          scale: beatRipple.interpolate({
-                            inputRange: [0, 1],
-                            outputRange: [0.5, 2],
-                          }),
-                        },
-                      ],
-                    },
-                  ]}
+                  style={{
+                    ...StyleSheet.absoluteFillObject,
+                    transform: [{
+                      scale: zone.pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.08] }),
+                    }],
+                    opacity: zone.pulse.interpolate({ inputRange: [0, 1], outputRange: [0.75, 1] }),
+                  }}
                 />
-              </Animated.View>
+              </View>
             ))}
-            <View style={styles.roadLine} />
+
+            {/* Traffic cars */}
+            {traffic.map((c) => (
+              <View
+                key={c.id}
+                style={[
+                  styles.aiCarIcon,
+                  { bottom: c.y, transform: [{ translateX: c.x }] },
+                ]}
+              >
+                <View style={[styles.aiCarBody, styles.cardShadow, { backgroundColor: c.color, borderColor: c.border }]}>
+                  <View style={[styles.aiCarTopPart, { backgroundColor: '#ffffff22' }]} />
+                  <View style={[styles.aiCarBottomPart, { backgroundColor: '#00000030' }]} />
+                  <View style={styles.aiCarWheel} />
+                  <View style={[styles.aiCarWheel, { right: 5 }]} />
+                </View>
+              </View>
+            ))}
           </View>
         </View>
 
-        {/* AI Cars */}
-        {memoizedAiCars}
-
         {/* Player Car */}
+        {/* Parent = layout-only (bottom, translateX). No native animations here. */}
         <Animated.View
           style={[
-            styles.playerCar,
-            {
-              transform: [
-                { translateX: carX },
-                {
-                  scale: boostGlow.interpolate({
-                    inputRange: [0, 1],
-                    outputRange: [1, 1.1],
-                  }),
-                },
-              ],
-            },
+            styles.carIcon,
+            { bottom: playerY, transform: [{ translateX: carX }] },
           ]}
         >
-          <CarIndicator isBoostActive={isBoostActive} boostLevel={boostLevel} />
+          {/* Child = visual boost scale (native). */}
+          <Animated.View
+            style={{
+              transform: [
+                { scale: boostGlow.interpolate({ inputRange: [0, 1], outputRange: [1, 1.12] }) },
+              ],
+            }}
+          >
+            <View style={[styles.carBody, styles.cardShadow]}>
+              <View style={styles.carTop} />
+              <View style={styles.carBottom} />
+              <View style={styles.carWheel} />
+              <View style={[styles.carWheel, { right: 5 }]} />
+              <View style={styles.neonGlow} />
+            </View>
+
+            {comboCount > 0 && (
+              <Animated.View style={[styles.comboBadge, { transform: [{ scale: comboScale }] }]}>
+                <Text style={styles.comboBadgeText}>{comboCount}x</Text>
+              </Animated.View>
+            )}
+          </Animated.View>
         </Animated.View>
 
-        {/* Debug Info */}
-        <View style={styles.debugContainer}>
-          <Text style={styles.debugText}>
-            State: {gameState} | Combo: {comboCount} | Beat: {currentBeatRef.current}{' '}
-            {currentLyric && `| Lyric: ${currentLyric.prompt}`}
-          </Text>
-          <Text style={styles.debugText}>
-            Car: {carPositionRef.current.toFixed(1)} | ActiveZones: {greenZones.length}
-          </Text>
-        </View>
-
-        {/* Lyric */}
+        {/* Lyric prompt */}
         <View style={styles.lyricContainer}>
           <Text style={styles.lyricText}>
             {currentLyric ? currentLyric.prompt : 'Get ready to rhyme!'}
           </Text>
         </View>
 
-        {/* Instruction */}
+        {/* Instruction panel */}
         <View style={styles.greenZoneIndicator}>
           <Text style={styles.greenZoneText}>
-            {greenZones.length ? 'TAP WHEN CAR IS IN GREEN ZONE!' : 'Waiting...'}
+            Tap in the GREEN zone for a BOOST! Swipe up/down to change lanes.
           </Text>
           <Text style={styles.beatCountText}>Beat {currentBeatRef.current}</Text>
         </View>
 
-        {/* Answer choices */}
-        <Animated.View
-          style={[
-            styles.answerContainer,
-            {
-              transform: [{ scale: answerChoicesScale }],
-              opacity: answerChoicesScale,
-            },
-          ]}
-        >
+        {/* Answers */}
+        <Animated.View style={[styles.answerContainer, { transform: [{ scale: answerChoicesScale }], opacity: answerChoicesScale }]}>
           {memoizedAnswerTiles}
         </Animated.View>
 
-        {/* Combo / Boost */}
-        {comboCount > 0 && (
-          <Animated.View style={[styles.comboContainer, { transform: [{ scale: comboScale }] }]}>
-            <Text style={styles.comboText}>Combo: {comboCount}x</Text>
-            {isBoostActive && (
-              <Animated.View
-                style={[
-                  styles.boostContainer,
-                  {
-                    opacity: boostGlow,
-                    transform: [
-                      {
-                        scale: boostGlow.interpolate({
-                          inputRange: [0, 1],
-                          outputRange: [1, 1.2],
-                        }),
-                      },
-                    ],
-                  },
-                ]}
-              >
-                <Text style={styles.boostText}>BOOST LEVEL {boostLevel}!</Text>
-              </Animated.View>
-            )}
-          </Animated.View>
-        )}
-
-        {/* Timing feedback */}
+        {/* Timing / Collision feedback */}
         {timingFeedback && (
-          <View style={styles.timingFeedbackContainer}>
+          <Animated.View style={[styles.timingFeedbackContainer, { opacity: feedbackOpacity, transform: [{ scale: feedbackScale }] }]}>
             <Text
               style={[
                 styles.timingFeedbackText,
                 timingFeedback === 'perfect' && styles.perfectText,
                 timingFeedback === 'good' && styles.goodText,
                 timingFeedback === 'miss' && styles.missText,
+                timingFeedback === 'bump' && styles.bumpText,
               ]}
             >
-              {timingFeedback.toUpperCase()}
+              {timingFeedback === 'bump' ? 'BUMP!' : timingFeedback.toUpperCase()}
             </Text>
-          </View>
+          </Animated.View>
         )}
 
         {/* Overlays */}
         {gameState === 'waiting' && (
           <View style={styles.overlay}>
-            <Text style={styles.overlayText}>Starting...</Text>
+            <Text style={styles.overlayText}>Starting…</Text>
           </View>
         )}
         {gameState === 'finished' && (
           <View style={styles.overlay}>
-            <Text style={styles.overlayText}>Game Over!</Text>
+            <Text style={styles.overlayText}>Time!</Text>
+            <Text style={[styles.overlayText, { marginTop: 8, fontSize: 18 }]}>
+              Distance: {Math.round(distanceMeters)} m
+            </Text>
           </View>
         )}
       </View>
@@ -695,204 +645,103 @@ export default function GameScreen() {
   );
 }
 
+/* ===================== Styles ===================== */
+const cardShadowBase = Platform.select({
+  ios: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 16,
+  },
+  android: { elevation: 12 },
+});
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#1a1a2e' },
+  container: { flex: 1, backgroundColor: COLORS.bg },
   gameArea: { flex: 1, position: 'relative' },
-  skyline: {
+
+  hud: {
     position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    height: height * 0.6,
-    zIndex: 1,
+    top: 10,
+    left: 12,
+    right: 12,
+    zIndex: 30,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(5,8,18,0.7)',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(120,140,255,0.25)',
   },
-  road: {
-    position: 'absolute',
-    bottom: height * 0.2,
-    left: 0,
-    right: 0,
-    height: 120,
-    zIndex: 2,
-  },
-  roadShoulder: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    height: 20,
-    backgroundColor: '#2a2a2a',
-  },
+  hudText: { color: COLORS.text, fontSize: 14, fontWeight: '700' },
+
+  skyline: { position: 'absolute', top: 0, left: 0, right: 0, height: height * 0.6, zIndex: 1 },
+
+  road: { position: 'absolute', bottom: height * 0.2, left: 0, right: 0, height: 120, zIndex: 2 },
+  roadShoulder: { position: 'absolute', top: 0, left: 0, right: 0, height: 20, backgroundColor: COLORS.roadEdge },
   roadLane: {
-    position: 'absolute',
-    top: 20,
-    left: 0,
-    right: 0,
-    height: 80,
-    backgroundColor: '#333',
-    borderTopWidth: 2,
-    borderBottomWidth: 2,
-    borderColor: '#fff',
+    position: 'absolute', top: 20, left: 0, right: 0, height: 80,
+    backgroundColor: COLORS.road, borderTopWidth: 2, borderBottomWidth: 2, borderColor: '#3b4578', overflow: 'hidden',
   },
+  roadDashesRow: { position: 'absolute', top: 39, flexDirection: 'row', alignItems: 'center', width: width * 2 },
+  roadDash: { width: 30, height: 2, marginRight: 10, backgroundColor: '#aab3ff', opacity: 0.55, borderRadius: 2 },
+
   greenZone: {
     position: 'absolute',
     top: 0,
     height: 80,
-    backgroundColor: 'rgba(0, 255, 0, 0.6)',
-    borderWidth: 3,
-    borderColor: '#00ff00',
-    borderRadius: 5,
-    overflow: 'hidden',
-  },
-  beatRipple: {
-    position: 'absolute',
-    top: '50%',
-    left: '50%',
-    width: 20,
-    height: 20,
     borderRadius: 10,
-    backgroundColor: 'rgba(255,255,255,0.6)',
-    transform: [{ translateX: -10 }, { translateY: -10 }],
-  },
-  roadLine: {
-    position: 'absolute',
-    top: 35,
-    left: 0,
-    right: 0,
-    height: 2,
-    backgroundColor: '#fff',
-    opacity: 0.5,
-  },
-  aiCar: {
-    position: 'absolute',
-    bottom: height * 0.2 + 40,
-    zIndex: 3,
-  },
-  playerCar: {
-    position: 'absolute',
-    bottom: height * 0.2 + 40,
-    zIndex: 4,
-  },
-  lyricContainer: {
-    position: 'absolute',
-    top: height * 0.1,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    padding: 15,
-    borderRadius: 10,
-    zIndex: 10,
-  },
-  lyricText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: 'bold',
-    textAlign: 'center',
-  },
-  greenZoneIndicator: {
-    position: 'absolute',
-    top: height * 0.3,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(0,255,0,0.2)',
-    padding: 10,
-    borderRadius: 10,
-    alignItems: 'center',
-    zIndex: 10,
-  },
-  greenZoneText: {
-    color: '#00ff00',
-    fontSize: 16,
-    fontWeight: 'bold',
-    textAlign: 'center',
-  },
-  beatCountText: {
-    color: '#fff',
-    fontSize: 14,
-    marginTop: 5,
-  },
-  answerContainer: {
-    position: 'absolute',
-    bottom: height * 0.5,
-    left: 20,
-    right: 20,
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    zIndex: 10,
-  },
-  comboContainer: {
-    position: 'absolute',
-    top: height * 0.15,
-    right: 20,
-    backgroundColor: 'rgba(255,215,0,0.9)',
-    padding: 10,
-    borderRadius: 10,
-    zIndex: 10,
-  },
-  comboText: {
-    color: '#000',
-    fontSize: 16,
-    fontWeight: 'bold',
-  },
-  boostContainer: {
-    marginTop: 5,
-    padding: 5,
-    backgroundColor: 'rgba(255,0,0,0.8)',
-    borderRadius: 5,
-  },
-  boostText: {
-    color: '#fff',
-    fontSize: 12,
-    fontWeight: 'bold',
-    textAlign: 'center',
+    borderWidth: 1.5,
+    borderColor: '#7bffb5',
+    backgroundColor: 'rgba(60,255,190,0.18)',
   },
 
-  debugContainer: {
-    position: 'absolute',
-    top: 10,
-    left: 10,
-    right: 10,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    padding: 10,
-    borderRadius: 5,
-    zIndex: 25,
+  aiCarIcon: { position: 'absolute', zIndex: 3 },
+  aiCarBody: { width: 35, height: 18, borderRadius: 9, position: 'relative', borderWidth: 1.5 },
+  aiCarTopPart: { position: 'absolute', top: -6, left: 6, right: 6, height: 6, borderRadius: 3 },
+  aiCarBottomPart: { position: 'absolute', bottom: -1, left: 4, right: 4, height: 3, borderRadius: 2 },
+  aiCarWheel: { position: 'absolute', bottom: -5, left: 4, width: 6, height: 6, borderRadius: 3, backgroundColor: '#0a0aa' },
+  // fix wheel border color line broken by wrap
+  aiCarWheel: { position: 'absolute', bottom: -5, left: 4, width: 6, height: 6, borderRadius: 3, backgroundColor: '#0a0a0a', borderWidth: 1, borderColor: '#1f1f1f' },
+
+  carIcon: { position: 'absolute', zIndex: 5 },
+  carBody: { width: 44, height: 22, backgroundColor: COLORS.neonPink, borderRadius: 12, position: 'relative', borderWidth: 2, borderColor: '#ff91e4' },
+  carTop: { position: 'absolute', top: -8, left: 8, right: 8, height: 8, backgroundColor: '#ff9deb', borderRadius: 4 },
+  carBottom: { position: 'absolute', bottom: -3, left: 6, right: 6, height: 5, backgroundColor: '#cf4fb0', borderRadius: 3 },
+  carWheel: { position: 'absolute', bottom: -6, left: 6, width: 8, height: 8, borderRadius: 4, backgroundColor: '#0a0a0a', borderWidth: 1, borderColor: '#1f1f1f' },
+  neonGlow: { position: 'absolute', top: -10, left: -10, right: -10, bottom: -10, borderRadius: 16, backgroundColor: COLORS.neonPink, opacity: 0.18 },
+
+  comboBadge: { position: 'absolute', top: -16, right: -12, backgroundColor: COLORS.neonYellow, borderRadius: 12, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 2, borderColor: '#ffbf3e' },
+  comboBadgeText: { fontSize: 12, fontWeight: '900', color: '#2c2100', letterSpacing: 0.3 },
+
+  lyricContainer: {
+    position: 'absolute', top: height * 0.1, left: 16, right: 16,
+    backgroundColor: 'rgba(14, 20, 48, 0.72)', paddingVertical: 14, paddingHorizontal: 16,
+    borderRadius: 14, borderWidth: 1, borderColor: 'rgba(130,150,255,0.25)', zIndex: 10, ...cardShadowBase,
   },
-  debugText: {
-    color: '#00ff00',
-    fontSize: 12,
-    fontFamily: 'monospace',
+  lyricText: { color: COLORS.text, fontSize: 18, fontWeight: '700', textAlign: 'center', letterSpacing: 0.2 },
+
+  greenZoneIndicator: {
+    position: 'absolute', top: height * 0.3, left: 16, right: 16,
+    backgroundColor: 'rgba(10, 255, 160, 0.12)', paddingVertical: 10, paddingHorizontal: 14,
+    borderRadius: 12, borderWidth: 1, borderColor: 'rgba(90,255,200,0.35)', alignItems: 'center', zIndex: 10, ...cardShadowBase,
   },
-  overlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 20,
-  },
-      timingFeedbackContainer: {
-      position: 'absolute',
-      top: height * 0.5,
-      left: 0,
-      right: 0,
-      alignItems: 'center',
-      zIndex: 15,
-    },
-    timingFeedbackText: {
-      fontSize: 24,
-      fontWeight: 'bold',
-      textShadowColor: 'rgba(0,0,0,0.8)',
-      textShadowOffset: { width: 2, height: 2 },
-      textShadowRadius: 4,
-    },
-    perfectText: { color: '#00FF00' },
-    goodText: { color: '#FFFF00' },
-    missText: { color: '#FF0000' },
-    overlayText: {
-      color: '#fff',
-      fontSize: 24,
-      fontWeight: 'bold',
-    },
-  });
+  greenZoneText: { color: COLORS.neonGreen, fontSize: 15, fontWeight: '700', textAlign: 'center', letterSpacing: 0.2 },
+  beatCountText: { color: COLORS.subtext, fontSize: 13, marginTop: 6 },
+
+  answerContainer: { position: 'absolute', bottom: height * 0.5, left: 12, right: 12, flexDirection: 'row', justifyContent: 'space-around', zIndex: 10 },
+
+  timingFeedbackContainer: { position: 'absolute', top: height * 0.5, left: 0, right: 0, alignItems: 'center', zIndex: 15 },
+  timingFeedbackText: { fontSize: 28, fontWeight: '900', letterSpacing: 1.2, textShadowColor: 'rgba(0,0,0,0.7)', textShadowOffset: { width: 2, height: 3 }, textShadowRadius: 6 },
+  perfectText: { color: COLORS.neonGreen },
+  goodText: { color: COLORS.neonYellow },
+  missText: { color: '#ff7676' },
+  bumpText: { color: COLORS.red },
+
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(2,4,12,0.86)', justifyContent: 'center', alignItems: 'center', zIndex: 20 },
+  overlayText: { color: COLORS.text, fontSize: 24, fontWeight: '800', letterSpacing: 0.5 },
+
+  cardShadow: { ...cardShadowBase },
+});

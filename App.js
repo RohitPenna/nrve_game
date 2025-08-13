@@ -5,6 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { registerRootComponent } from 'expo';
 
+import StartScreen from './screens/StartScreen';
 import GameScreen from './screens/GameScreen';
 import ResultScreen from './screens/ResultScreen';
 
@@ -15,27 +16,14 @@ function App() {
     <SafeAreaProvider>
       <NavigationContainer>
         <Stack.Navigator 
-          initialRouteName="Game"
+          initialRouteName="Start"
           screenOptions={{
-            headerStyle: {
-              backgroundColor: '#6200EE',
-            },
-            headerTintColor: '#fff',
-            headerTitleStyle: {
-              fontWeight: 'bold',
-            },
+            headerShown: false,
           }}
         >
-          <Stack.Screen 
-            name="Game" 
-            component={GameScreen} 
-            options={{ title: 'Rhyme Racer' }}
-          />
-          <Stack.Screen 
-            name="Result" 
-            component={ResultScreen} 
-            options={{ title: 'Game Results' }}
-          />
+          <Stack.Screen name="Start" component={StartScreen} />
+          <Stack.Screen name="Game" component={GameScreen} />
+          <Stack.Screen name="Result" component={ResultScreen} />
         </Stack.Navigator>
         <StatusBar style="light" />
       </NavigationContainer>
